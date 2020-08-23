@@ -6,21 +6,22 @@ jobs:
     vmImage: 'vs2017-win2016'
   continueOnError: true
   steps:
-  - script: curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
-    displayName: 'Install cargo'
   - script: |
-      PATH=%PATH%;%USERPROFILE%\.cargo\bin
+      curl -sSf -o rustup-init.exe https://win.rustup.rs
+      rustup-init.exe -y --default-toolchain stable --default-host x86_64-pc-windows-msvc
+      echo "##vso[task.setvariable variable=PATH;]%PATH%;%USERPROFILE%\.cargo\bin"
+    displayName: 'Install Rust'
+  - script: |
       cargo build --lib
     displayName: 'Build library'
   - script: |
-      PATH=%PATH%;%USERPROFILE%\.cargo\bin
       cargo test --lib
     displayName: 'Test library'
 
 - job: macOS
   displayName: 'macOS'
   pool:
-    vmImage: 'macOS-10.13'
+    vmImage: 'macOS-10.15'
   continueOnError: true
   steps:
   - script: |
@@ -34,19 +35,28 @@ jobs:
       rustup target add aarch64-apple-ios
       cargo build --lib --target aarch64-apple-ios
     displayName: 'Build library for iOS'
+  - script: |
+      export PATH=$PATH:$HOME/.cargo/bin
+      rustup component add rustfmt
+      cargo fmt --all -- --check
+    displayName: 'Cargo fmt'
 
 - job: Linux_x86_64
   displayName: 'Linux x86-64'
   pool:
-    vmImage: 'ubuntu-16.04'
+    vmImage: 'ubuntu-20.04'
   continueOnError: true
   steps:
   - script: |
-      sudo add-apt-repository ppa:wireguard/wireguard
       sudo apt-get update
       sudo apt-get install wireguard -y
     displayName: 'Install wireguard'
   - template: ci/azure-build.yml
+  - script: |
+      export PATH=$PATH:$HOME/.cargo/bin
+      rustup component add rustfmt
+      cargo fmt --all -- --check
+    displayName: 'Cargo fmt'
 
 - job: Linux_aarch64
   displayName: 'Linux aarch64'

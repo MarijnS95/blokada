@@ -1,29 +1,24 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+use super::PacketData;
 #[cfg(target_arch = "arm")]
 use crate::crypto::chacha20poly1305::*;
 use crate::noise::errors::WireGuardError;
-use crate::noise::make_array;
 #[cfg(not(target_arch = "arm"))]
 use ring::aead::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(not(target_arch = "arm"))]
 pub struct Session {
     receiving_index: u32,
     sending_index: u32,
-    receiver: OpeningKey,
-    sender: SealingKey,
-    sending_key_counter: AtomicUsize,
-    receiving_key_counter: spin::Mutex<ReceivingKeyCounterValidator>,
-}
-
-#[cfg(target_arch = "arm")]
-pub struct Session {
-    receiving_index: u32,
-    sending_index: u32,
+    #[cfg(not(target_arch = "arm"))]
+    receiver: LessSafeKey,
+    #[cfg(not(target_arch = "arm"))]
+    sender: LessSafeKey,
+    #[cfg(target_arch = "arm")]
     receiver: ChaCha20Poly1305,
+    #[cfg(target_arch = "arm")]
     sender: ChaCha20Poly1305,
     sending_key_counter: AtomicUsize,
     receiving_key_counter: spin::Mutex<ReceivingKeyCounterValidator>,
@@ -39,17 +34,8 @@ impl std::fmt::Debug for Session {
     }
 }
 
-// WireGuard constants
-const PACKET_DATA_TYPE: u32 = 4;
-
-const MSG_TYPE_OFF: usize = 0;
-const MSG_TYPE_SZ: usize = 4;
-pub const IDX_OFF: usize = MSG_TYPE_OFF + MSG_TYPE_SZ;
-pub const IDX_SZ: usize = 4;
-const CTR_OFF: usize = IDX_OFF + IDX_SZ;
-const CTR_SZ: usize = 8;
-const DATA_OFF: usize = CTR_OFF + CTR_SZ;
-const AEAD_SIZE: usize = 16;
+const DATA_OFFSET: usize = 16; // Where encrypted data resides in a data packet
+const AEAD_SIZE: usize = 16; // The overhead of the AEAE
 
 // Receiving buffer constants
 const WORD_SIZE: u64 = 64;
@@ -59,8 +45,9 @@ const N_BITS: u64 = WORD_SIZE * N_WORDS;
 #[derive(Debug, Clone, Default)]
 struct ReceivingKeyCounterValidator {
     // In order to avoid replays while allowing for some reordering of the packets, we keep a
-    // bitmask of received packets, and the value of the highest counter
+    // bitmap of received packets, and the value of the highest counter
     next: u64,
+    receive_cnt: u64, // Used to estimate packet loss
     bitmap: [u64; N_WORDS as usize],
 }
 
@@ -166,34 +153,31 @@ impl ReceivingKeyCounterValidator {
 }
 
 impl Session {
-    pub fn new(
+    pub(super) fn new(
         local_index: u32,
         peer_index: u32,
         receiving_key: [u8; 32],
         sending_key: [u8; 32],
     ) -> Session {
-        #[cfg(not(target_arch = "arm"))]
-        return Session {
+        Session {
             receiving_index: local_index,
             sending_index: peer_index,
-            receiver: OpeningKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
-            sender: SealingKey::new(&CHACHA20_POLY1305, &sending_key).unwrap(),
-            sending_key_counter: AtomicUsize::new(0),
-            receiving_key_counter: spin::Mutex::new(Default::default()),
-        };
-
-        #[cfg(target_arch = "arm")]
-        return Session {
-            receiving_index: local_index,
-            sending_index: peer_index,
+            #[cfg(not(target_arch = "arm"))]
+            receiver: LessSafeKey::new(
+                UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
+            ),
+            #[cfg(not(target_arch = "arm"))]
+            sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
+            #[cfg(target_arch = "arm")]
             receiver: ChaCha20Poly1305::new_aead(&receiving_key[..]),
+            #[cfg(target_arch = "arm")]
             sender: ChaCha20Poly1305::new_aead(&sending_key[..]),
             sending_key_counter: AtomicUsize::new(0),
             receiving_key_counter: spin::Mutex::new(Default::default()),
-        };
+        }
     }
 
-    pub fn local_index(&self) -> usize {
+    pub(super) fn local_index(&self) -> usize {
         self.receiving_index as usize
     }
 
@@ -210,105 +194,112 @@ impl Session {
     // Returns true if receiving counter is good to use, and marks it as used {
     fn receiving_counter_mark(&self, counter: u64) -> Result<(), WireGuardError> {
         let mut counter_validator = self.receiving_key_counter.lock();
-        counter_validator.mark_did_receive(counter)
+        let ret = counter_validator.mark_did_receive(counter);
+        if ret.is_ok() {
+            counter_validator.receive_cnt += 1;
+        }
+        ret
     }
 
     // src - an IP packet from the interface
-    // dst - preallocated space to hold the encapsulating UDP packet to send over the network
+    // dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     // returns the size of the formatted packet
-    pub fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
-        if DATA_OFF + src.len() + AEAD_SIZE > dst.len() {
-            // This is a very incorrect use of the library, therefore panic and not error
+    pub(super) fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
 
         let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
-        dst[MSG_TYPE_OFF..MSG_TYPE_OFF + MSG_TYPE_SZ]
-            .copy_from_slice(&PACKET_DATA_TYPE.to_le_bytes());
-        dst[IDX_OFF..IDX_OFF + IDX_SZ].copy_from_slice(&self.sending_index.to_le_bytes());
-        dst[CTR_OFF..CTR_OFF + CTR_SZ].copy_from_slice(&sending_key_counter.to_le_bytes());
-        // TODO: spec requires padding to 16 bytes, but actually works fine without it
 
+        let (message_type, rest) = dst.split_at_mut(4);
+        let (receiver_index, rest) = rest.split_at_mut(4);
+        let (counter, data) = rest.split_at_mut(8);
+
+        message_type.copy_from_slice(&super::DATA.to_le_bytes());
+        receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
+        counter.copy_from_slice(&sending_key_counter.to_le_bytes());
+
+        // TODO: spec requires padding to 16 bytes, but actually works fine without it
         #[cfg(not(target_arch = "arm"))]
-        {
+        let n = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
-            dst[DATA_OFF..DATA_OFF + src.len()].copy_from_slice(src);
-            let n = seal_in_place(
-                &self.sender,
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(&[]),
-                &mut dst[DATA_OFF..DATA_OFF + src.len() + AEAD_SIZE],
-                AEAD_SIZE,
-            )
-            .unwrap();
-            &mut dst[..DATA_OFF + n]
-        }
+            data[..src.len()].copy_from_slice(src);
+            self.sender
+                .seal_in_place_separate_tag(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(&[]),
+                    &mut data[..src.len()],
+                )
+                .map(|tag| {
+                    data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                    src.len() + AEAD_SIZE
+                })
+                .unwrap()
+        };
 
         #[cfg(target_arch = "arm")]
-        {
-            let n = self.sender.seal_wg(
-                sending_key_counter,
-                &[],
-                src,
-                &mut dst[DATA_OFF..DATA_OFF + src.len() + AEAD_SIZE],
-            );
-            &mut dst[..DATA_OFF + n]
-        }
+        let n = self.sender.seal_wg(
+            sending_key_counter,
+            &[],
+            src,
+            &mut data[..src.len() + AEAD_SIZE],
+        );
+
+        &mut dst[..DATA_OFFSET + n]
     }
 
-    // src - a packet we received from the network
-    // dst - preallocated space to hold the encapsulated IP packet, to send to the interface
+    // packet - a data packet we received from the network
+    // dst - pre-allocated space to hold the encapsulated IP packet, to send to the interface
     //       dst will always take less space than src
     // return the size of the encapsulated packet on success
-    pub fn receive_packet_data<'a>(
+    pub(super) fn receive_packet_data<'a>(
         &self,
-        src: &[u8],
+        packet: PacketData,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        if DATA_OFF + dst.len() + AEAD_SIZE < src.len() {
+        let ct_len = packet.encrypted_encapsulated_packet.len();
+        if dst.len() < ct_len {
             // This is a very incorrect use of the library, therefore panic and not error
             panic!("The destination buffer is too small");
         }
-        let message_type = u32::from_le_bytes(make_array(&src[MSG_TYPE_OFF..]));
-        if message_type != PACKET_DATA_TYPE {
-            return Err(WireGuardError::WrongPacketType);
-        }
-        let receiver_index = u32::from_le_bytes(make_array(&src[IDX_OFF..]));
-        let receiving_key_counter = u64::from_le_bytes(make_array(&src[CTR_OFF..]));
-        if receiver_index != self.receiving_index {
+        if packet.receiver_idx != self.receiving_index {
             return Err(WireGuardError::WrongIndex);
         }
         // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
-        self.receiving_counter_quick_check(receiving_key_counter)?;
+        self.receiving_counter_quick_check(packet.counter)?;
 
         #[cfg(not(target_arch = "arm"))]
-        {
+        let ret = {
             let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&receiving_key_counter.to_le_bytes());
-            dst[..src.len() - DATA_OFF].copy_from_slice(&src[DATA_OFF..]);
-            let packet = open_in_place(
-                &self.receiver,
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(&[]),
-                0,
-                &mut dst[..src.len() - DATA_OFF],
-            )
-            .map_err(|_| WireGuardError::InvalidAeadTag)?;
-            // After decryption is done, check counter again, and mark as received
-            self.receiving_counter_mark(receiving_key_counter)?;
-            Ok(packet)
-        }
+            nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
+            dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
+            self.receiver
+                .open_in_place(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(&[]),
+                    &mut dst[..ct_len],
+                )
+                .map_err(|_| WireGuardError::InvalidAeadTag)?
+        };
 
         #[cfg(target_arch = "arm")]
-        {
-            let packet =
-                self.receiver
-                    .open_wg(receiving_key_counter, &[], &src[DATA_OFF..], dst)?;
+        let ret = self.receiver.open_wg(
+            packet.counter,
+            &[],
+            packet.encrypted_encapsulated_packet,
+            dst,
+        )?;
 
-            self.receiving_counter_mark(receiving_key_counter)?;
-            Ok(packet)
-        }
+        // After decryption is done, check counter again, and mark as received
+        self.receiving_counter_mark(packet.counter)?;
+        Ok(ret)
+    }
+
+    // Returns the estimated downstream packet loss for this session
+    pub(super) fn current_packet_cnt(&self) -> (u64, u64) {
+        let counter_validator = self.receiving_key_counter.lock();
+        (counter_validator.next, counter_validator.receive_cnt)
     }
 }
 

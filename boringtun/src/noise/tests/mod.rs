@@ -28,7 +28,7 @@ mod tests {
         }
     }
 
-    // Very dumb spinlock
+    // Very dumb spin lock
     struct SpinLock {
         lock: AtomicBool,
     }
@@ -168,7 +168,7 @@ mod tests {
         network_socket: UdpSocket,
         static_private: &str,
         peer_static_public: &str,
-        logger: Box<Fn(&str) + Send>,
+        logger: Box<dyn Fn(&str) + Send>,
         close: Arc<AtomicBool>,
     ) -> UdpSocket {
         let static_private = static_private.parse().unwrap();
@@ -180,6 +180,7 @@ mod tests {
             None,
             None,
             100,
+            None,
         )
         .unwrap();
         peer.set_logger(logger, Verbosity::Debug);
@@ -220,13 +221,13 @@ mod tests {
                     }
                 };
 
-                match peer.network_to_tunnel(&recv_buf[..n], &mut send_buf) {
+                match peer.decapsulate(None, &recv_buf[..n], &mut send_buf) {
                     TunnResult::WriteToNetwork(packet) => {
                         network_socket.send(packet).unwrap();
                         // Send form queue?
                         loop {
                             let mut send_buf = [0u8; MAX_PACKET];
-                            match peer.network_to_tunnel(&[], &mut send_buf) {
+                            match peer.decapsulate(None, &[], &mut send_buf) {
                                 TunnResult::WriteToNetwork(packet) => {
                                     network_socket.send(packet).unwrap();
                                 }
@@ -267,7 +268,7 @@ mod tests {
                     }
                 };
 
-                match peer.tunnel_to_network(&recv_buf[..n], &mut send_buf) {
+                match peer.encapsulate(&recv_buf[..n], &mut send_buf) {
                     TunnResult::WriteToNetwork(packet) => {
                         network_socket.send(packet).unwrap();
                     }

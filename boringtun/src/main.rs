@@ -1,10 +1,14 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#[macro_use] extern crate log;
+#[macro_use]
+extern crate log;
 
 pub mod crypto;
-mod device;
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+pub mod device;
+
 pub mod ffi;
 pub mod noise;
 
@@ -77,6 +81,7 @@ fn main() {
                 .default_value("/tmp/boringtun.err"),
             Arg::with_name("disable-drop-privileges")
                 .long("disable-drop-privileges")
+                .env("WG_SUDO")
                 .help("Do not drop sudo privileges"),
             Arg::with_name("disable-connected-udp")
                 .long("disable-connected-udp")

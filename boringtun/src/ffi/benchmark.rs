@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 /// This module implements benchmarking code for use with the FFI bindings
-use crate::crypto::blake2s::*;
+use crate::crypto::blake2s::Blake2s;
 use crate::crypto::chacha20poly1305::*;
 use crate::crypto::x25519::*;
 #[cfg(not(target_arch = "arm"))]
@@ -49,7 +49,7 @@ fn format_float(number: f64) -> String {
     formatted
 }
 
-fn run_bench(test_func: &mut FnMut() -> usize) -> f64 {
+fn run_bench(test_func: &mut dyn FnMut() -> usize) -> f64 {
     let mut best_time = std::f64::MAX;
 
     // Take the best result out of ITRS runs
@@ -127,17 +127,21 @@ fn bench_chacha20poly1305_ring(name: bool, n: usize) -> String {
         return format!("(Ring) AEAD Seal {}B: ", n);
     }
 
-    let key = SealingKey::new(&CHACHA20_POLY1305, &[0x0fu8; 32]).unwrap();
+    let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &[0x0fu8; 32]).unwrap());
     let mut buf_in = vec![0u8; n + 16];
 
     let result = run_bench(&mut move || {
-        seal_in_place(
-            &key,
+        let tag_len = CHACHA20_POLY1305.tag_len();
+        let buf_len = buf_in.len();
+        key.seal_in_place_separate_tag(
             Nonce::assume_unique_for_key([0u8; 12]),
             Aad::from(&[]),
-            &mut buf_in,
-            16,
+            &mut buf_in[..buf_len - tag_len],
         )
+        .map(|tag| {
+            buf_in[buf_len - tag_len..].copy_from_slice(tag.as_ref());
+            buf_len
+        })
         .unwrap()
     });
 
@@ -171,17 +175,17 @@ fn bench_x25519_shared_key_ring(name: bool, _: usize) -> String {
             agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).unwrap();
         peer_private_key.compute_public_key().unwrap()
     };
-    let peer_public_key = untrusted::Input::from(peer_public_key.as_ref());
     let peer_public_key_alg = &agreement::X25519;
 
     let result = run_bench(&mut move || {
         let my_private_key =
             agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).unwrap();
+        let my_public_key =
+            agreement::UnparsedPublicKey::new(peer_public_key_alg, &peer_public_key);
 
         agreement::agree_ephemeral(
             my_private_key,
-            peer_public_key_alg,
-            peer_public_key,
+            &my_public_key,
             ring::error::Unspecified,
             |_key_material| Ok(()),
         )

@@ -40,7 +40,9 @@ struct stats
     int64_t time_since_last_handshake;
     size_t tx_bytes;
     size_t rx_bytes;
-    uint8_t reserved[64];
+    float estimated_loss;
+    int32_t estimated_rtt; // rtt estimated on time it took to complete latest initiated handshake in ms
+    uint8_t reserved[56];  // decrement appropriately when adding new fields
 };
 
 struct x25519_key
@@ -65,6 +67,7 @@ int check_base64_encoded_x25519_key(const char *key);
 // Allocate a new tunnel
 struct wireguard_tunnel *new_tunnel(const char *static_private,
                                     const char *server_static_public,
+                                    uint16_t keep_alive,
                                     void (*log_printer)(const char *),
                                     enum log_level log_level);
 
