@@ -34,13 +34,21 @@ class BoringTunJNI {
             "ConnectionExpired"
         )
 
+        @JvmStatic
         external fun x25519_secret_key(): ByteArray
+        @JvmStatic
         external fun x25519_public_key(secret_key: ByteArray): ByteArray
+        @JvmStatic
         external fun x25519_key_to_hex(key: ByteArray): String
+        @JvmStatic
         external fun x25519_key_to_base64(key: ByteArray): String
+        @JvmStatic
         external fun new_tunnel(secret_key: String, public_key: String): Long
+        @JvmStatic
         external fun wireguard_write(tunnel: Long, src: ByteArray, src_size: Int, dst: ByteBuffer, dst_size: Int, op: ByteBuffer): Int
+        @JvmStatic
         external fun wireguard_read(tunnel: Long, src: ByteArray, src_size: Int, dst: ByteBuffer, dst_size: Int, op: ByteBuffer): Int
+        @JvmStatic
         external fun wireguard_tick(tunnel: Long, dst: ByteBuffer, dst_size: Int, op: ByteBuffer): Int
     }
 }
